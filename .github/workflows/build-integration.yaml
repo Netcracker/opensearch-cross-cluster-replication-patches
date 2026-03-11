@@ -1,0 +1,122 @@
+---
+
+name: Integration Build
+run-name: "CCR: ${{ inputs.ccr-tag }} | Patches: ${{ inputs.patches-dir }} | Tag: ${{ inputs.tag }} | JDKs: ${{ inputs.jdks }}"
+on:
+  workflow_dispatch:
+    inputs:
+      ccr-tag:
+        default: 2.19.4.0
+        description: cross-cluster-replication tag or branch to apply patches to
+        required: true
+        type: string
+
+      tag:
+        default: 2.19.4.0-patched
+        description: Tag name to tag the build and attach artifacts
+        required: true
+        type: string
+      patches-dir:
+        default: patches/2.19.4.0
+        description: Directory with patches
+        required: true
+        type: string
+      jdks:
+        default: '11,17'
+        description: JDK versions to build for
+        required: true
+        type: string
+jobs:
+  check-tag:
+    name: Check tag ${{ inputs.tag }} existence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check tag
+        uses: netcracker/qubership-workflow-hub/actions/tag-action@v2.1.1
+        with:
+          check-tag: true
+          tag-name: ${{ inputs.tag }}
+          create-tag: false
+  prepare:
+    needs: check-tag
+    permissions:
+      contents: write
+    outputs:
+      custom-branch: ${{ steps.output.outputs.custom_branch }}
+    name: Apply cross-cluster-replication (${{ inputs.ccr-tag }}) patches (${{ inputs.patches-dir }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set output
+        id: output
+        run: |
+          echo "custom_branch=applied-patches-${{ github.event.inputs.ccr-tag }}-${{ github.run_id }}" >> $GITHUB_OUTPUT
+
+      - name: Checkout cross-cluster-replication source
+        uses: actions/checkout@v6
+        with:
+          repository: opensearch-project/cross-cluster-replication
+          ref: ${{ inputs.ccr-tag }}
+          path: cross-cluster-replication
+
+      - name: Checkout patches
+        uses: actions/checkout@v6
+        with:
+          path: ccr-patches
+
+      - name: Apply patches
+        run: |
+          cd ${GITHUB_WORKSPACE}/cross-cluster-replication
+          for p in ../ccr-patches/${{ inputs.patches-dir }}/*.patch; do
+            echo "Applying $p..."
+            git apply -p1 --ignore-space-change --ignore-whitespace "$p"
+          done
+
+      - name: Create a new branch and commit changes
+        run: |
+          cd ${GITHUB_WORKSPACE}/ccr-patches
+          mv -f ${GITHUB_WORKSPACE}/cross-cluster-replication/* .
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+          git checkout -b "${{ steps.output.outputs.custom_branch }}"
+          git add .
+          git commit -m "Applied custom patches to cross-cluster-replication ${{ inputs.ccr-tag }}"
+          git push origin "${{ steps.output.outputs.custom_branch }}"
+
+  build:
+    needs: prepare
+    name: Build patched cross-cluster-replication
+    uses: netcracker/opensearch-cross-cluster-replication-patches/.github/workflows/build-and-test.yaml@main
+    with:
+      ref: ${{ needs.prepare.outputs.custom-branch }}
+      jdks: ${{ inputs.jdks }}
+
+  release:
+    name: Create release
+    needs: [prepare, build]
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create tag ${{ inputs.tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        uses: netcracker/qubership-workflow-hub/actions/tag-action@v2.1.1
+        with:
+          create-release: true
+          create-tag: true
+          draft-release: "false"
+          ref: ${{ needs.prepare.outputs.custom-branch }}
+          tag-name: ${{ inputs.tag }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: Upload assets to release ${{ inputs.tag }}
+        uses: AButler/upload-release-assets@v3.0
+        with:
+          files: "artifacts/**/*"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          release-tag: ${{ inputs.tag }}
