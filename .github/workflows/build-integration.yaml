@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       patches-dir:
-        default: patches/2.19.4.0
+        default: patches
         description: Directory with patches
         required: true
         type: string
