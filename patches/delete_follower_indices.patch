@@ -1,0 +1,414 @@
+diff --git a/src/main/kotlin/org/opensearch/replication/ReplicationPlugin.kt b/src/main/kotlin/org/opensearch/replication/ReplicationPlugin.kt
+index 3790c3c..bb1adf5 100644
+--- a/src/main/kotlin/org/opensearch/replication/ReplicationPlugin.kt
++++ b/src/main/kotlin/org/opensearch/replication/ReplicationPlugin.kt
+@@ -41,7 +41,9 @@ import org.opensearch.replication.action.status.ReplicationStatusAction
+ import org.opensearch.replication.action.status.ShardsInfoAction
+ import org.opensearch.replication.action.status.TranportShardsInfoAction
+ import org.opensearch.replication.action.status.TransportReplicationStatusAction
++import org.opensearch.replication.action.stop.InternalStopIndexReplicationAction
+ import org.opensearch.replication.action.stop.StopIndexReplicationAction
++import org.opensearch.replication.action.stop.TransportInternalStopIndexReplicationAction
+ import org.opensearch.replication.action.stop.TransportStopIndexReplicationAction
+ import org.opensearch.replication.action.update.TransportUpdateIndexReplicationAction
+ import org.opensearch.replication.action.update.UpdateIndexReplicationAction
+@@ -201,6 +203,8 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
+                 Setting.Property.Dynamic, Setting.Property.NodeScope)
+         val REPLICATION_AUTOFOLLOW_CONCURRENT_REPLICATION_JOBS_TRIGGER_SIZE: Setting<Int> = Setting.intSetting("plugins.replication.autofollow.concurrent_replication_jobs_trigger_size", 3, 1, 10,
+             Setting.Property.Dynamic, Setting.Property.NodeScope)
++        val REPLICATION_REPLICATE_INDEX_DELETION: Setting<Boolean> = Setting.boolSetting("plugins.replication.replicate.delete_index", false,
++            Setting.Property.Dynamic, Setting.Property.NodeScope)
+     }
+
+     override fun createComponents(client: Client, clusterService: ClusterService, threadPool: ThreadPool,
+@@ -234,6 +238,7 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
+             ActionHandler(UpdateAutoFollowPatternAction.INSTANCE, TransportUpdateAutoFollowPatternAction::class.java),
+             ActionHandler(AutoFollowClusterManagerNodeAction.INSTANCE, TransportAutoFollowClusterManagerNodeAction::class.java),
+             ActionHandler(StopIndexReplicationAction.INSTANCE, TransportStopIndexReplicationAction::class.java),
++            ActionHandler(InternalStopIndexReplicationAction.INSTANCE, TransportInternalStopIndexReplicationAction::class.java),
+             ActionHandler(PauseIndexReplicationAction.INSTANCE, TransportPauseIndexReplicationAction::class.java),
+             ActionHandler(ResumeIndexReplicationAction.INSTANCE, TransportResumeIndexReplicationAction::class.java),
+             ActionHandler(UpdateIndexReplicationAction.INSTANCE, TransportUpdateIndexReplicationAction::class.java),
+@@ -360,7 +365,7 @@ internal class ReplicationPlugin : Plugin(), ActionPlugin, PersistentTaskPlugin,
+             REPLICATION_AUTOFOLLOW_REMOTE_INDICES_RETRY_POLL_INTERVAL, REPLICATION_METADATA_SYNC_INTERVAL,
+             REPLICATION_RETENTION_LEASE_MAX_FAILURE_DURATION, REPLICATION_INDEX_TRANSLOG_PRUNING_ENABLED_SETTING,
+             REPLICATION_INDEX_TRANSLOG_RETENTION_SIZE, REPLICATION_FOLLOWER_BLOCK_START, REPLICATION_AUTOFOLLOW_CONCURRENT_REPLICATION_JOBS_TRIGGER_SIZE,
+-            REPLICATION_FOLLOWER_CONCURRENT_WRITERS_PER_SHARD)
++            REPLICATION_FOLLOWER_CONCURRENT_WRITERS_PER_SHARD, REPLICATION_REPLICATE_INDEX_DELETION)
+     }
+     override fun getInternalRepositories(env: Environment, namedXContentRegistry: NamedXContentRegistry,
+                                          clusterService: ClusterService, recoverySettings: RecoverySettings): Map<String, Repository.Factory> {
+diff --git a/src/main/kotlin/org/opensearch/replication/ReplicationSettings.kt b/src/main/kotlin/org/opensearch/replication/ReplicationSettings.kt
+index a5065c6..220722b 100644
+--- a/src/main/kotlin/org/opensearch/replication/ReplicationSettings.kt
++++ b/src/main/kotlin/org/opensearch/replication/ReplicationSettings.kt
+@@ -33,6 +33,7 @@ open class ReplicationSettings(clusterService: ClusterService) {
+     @Volatile var leaseRenewalMaxFailureDuration: TimeValue = clusterService.clusterSettings.get(ReplicationPlugin.REPLICATION_RETENTION_LEASE_MAX_FAILURE_DURATION)
+     @Volatile var followerBlockStart: Boolean = clusterService.clusterSettings.get(ReplicationPlugin.REPLICATION_FOLLOWER_BLOCK_START)
+     @Volatile var autofollowConcurrentJobsTriggerSize: Int = clusterService.clusterSettings.get(ReplicationPlugin.REPLICATION_AUTOFOLLOW_CONCURRENT_REPLICATION_JOBS_TRIGGER_SIZE)
++    @Volatile var replicateIndexDeletion: Boolean = clusterService.clusterSettings.get(ReplicationPlugin.REPLICATION_REPLICATE_INDEX_DELETION)
+
+     init {
+         listenForUpdates(clusterService.clusterSettings)
+@@ -51,5 +52,6 @@ open class ReplicationSettings(clusterService: ClusterService) {
+         clusterSettings.addSettingsUpdateConsumer(ReplicationPlugin.REPLICATION_METADATA_SYNC_INTERVAL) { metadataSyncInterval = it }
+         clusterSettings.addSettingsUpdateConsumer(ReplicationPlugin.REPLICATION_FOLLOWER_BLOCK_START) { followerBlockStart = it }
+         clusterSettings.addSettingsUpdateConsumer(ReplicationPlugin.REPLICATION_AUTOFOLLOW_CONCURRENT_REPLICATION_JOBS_TRIGGER_SIZE) { autofollowConcurrentJobsTriggerSize = it }
++        clusterSettings.addSettingsUpdateConsumer(ReplicationPlugin.REPLICATION_REPLICATE_INDEX_DELETION) { replicateIndexDeletion = it }
+     }
+ }
+diff --git a/src/main/kotlin/org/opensearch/replication/action/stop/InternalStopIndexReplicationAction.kt b/src/main/kotlin/org/opensearch/replication/action/stop/InternalStopIndexReplicationAction.kt
+new file mode 100644
+index 0000000..1926039
+--- /dev/null
++++ b/src/main/kotlin/org/opensearch/replication/action/stop/InternalStopIndexReplicationAction.kt
+@@ -0,0 +1,22 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ *
++ * Modifications Copyright OpenSearch Contributors. See
++ * GitHub history for details.
++ */
++
++package org.opensearch.replication.action.stop
++
++import org.opensearch.action.ActionType
++import org.opensearch.action.support.master.AcknowledgedResponse
++
++class InternalStopIndexReplicationAction private constructor(): ActionType<AcknowledgedResponse>(NAME, ::AcknowledgedResponse) {
++    companion object {
++        const val NAME = "indices:internal/plugins/replication/index/stop"
++        val INSTANCE: InternalStopIndexReplicationAction = InternalStopIndexReplicationAction()
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/org/opensearch/replication/action/stop/TransportInternalStopIndexReplicationAction.kt b/src/main/kotlin/org/opensearch/replication/action/stop/TransportInternalStopIndexReplicationAction.kt
+new file mode 100644
+index 0000000..11b6f7d
+--- /dev/null
++++ b/src/main/kotlin/org/opensearch/replication/action/stop/TransportInternalStopIndexReplicationAction.kt
+@@ -0,0 +1,75 @@
++/*
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * The OpenSearch Contributors require contributions made to
++ * this file be licensed under the Apache-2.0 license or a
++ * compatible open source license.
++ *
++ * Modifications Copyright OpenSearch Contributors. See
++ * GitHub history for details.
++ */
++
++package org.opensearch.replication.action.stop
++
++import kotlinx.coroutines.CoroutineScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.GlobalScope
++import kotlinx.coroutines.launch
++import org.apache.logging.log4j.LogManager
++import org.opensearch.action.support.HandledTransportAction
++import org.opensearch.action.ActionRequest
++import org.opensearch.action.support.ActionFilters
++import org.opensearch.action.support.master.AcknowledgedResponse
++import org.opensearch.client.Client
++import org.opensearch.common.inject.Inject
++import org.opensearch.cluster.metadata.IndexNameExpressionResolver
++import org.opensearch.cluster.service.ClusterService
++import org.opensearch.commons.utils.recreateObject
++import org.opensearch.core.action.ActionListener
++import org.opensearch.replication.metadata.ReplicationMetadataManager
++import org.opensearch.replication.util.coroutineContext
++import org.opensearch.replication.util.stackTraceToString
++import org.opensearch.replication.util.suspendExecute
++import org.opensearch.tasks.Task
++import org.opensearch.threadpool.ThreadPool
++import org.opensearch.transport.TransportService
++
++/* Internal transport action used by Index Management plugin to invoke stop replication
++   It transforms the request, and invokes the actual stop replication action (TransportStopIndexReplicationAction)
++ */
++class TransportInternalStopIndexReplicationAction @Inject constructor (
++    val name: String,
++    val transportService: TransportService,
++    val clusterService: ClusterService,
++    val threadPool: ThreadPool,
++    val client: Client,
++    val actionFilters: ActionFilters,
++    val indexNameExpressionResolver: IndexNameExpressionResolver,
++    val replicationMetadataManager: ReplicationMetadataManager,
++): HandledTransportAction<ActionRequest, AcknowledgedResponse> (InternalStopIndexReplicationAction.NAME, transportService, actionFilters, ::StopIndexReplicationRequest),
++    CoroutineScope by GlobalScope  {
++    companion object {
++        private val log = LogManager.getLogger(TransportInternalStopIndexReplicationAction::class.java)
++    }
++
++    @Throws(Exception::class)
++    override fun doExecute(task: Task?, request: ActionRequest?, listener: ActionListener<AcknowledgedResponse>?) {
++        launch(Dispatchers.Unconfined + threadPool.coroutineContext()) {
++            val transformedRequest = if (request is StopIndexReplicationRequest) {
++                request
++            } else {
++                request?.let { recreateObject(it) { StopIndexReplicationRequest(it) } }
++                    ?: throw IllegalArgumentException("Request cannot be null")
++            }
++
++            try {
++                val response = client.suspendExecute(StopIndexReplicationAction.INSTANCE, transformedRequest, true)
++                log.info("Stop replication successful for index[${transformedRequest.indexName}] with response: " + response.isAcknowledged)
++                listener?.onResponse(AcknowledgedResponse(true))
++            } catch (e: Exception) {
++                log.error("Stop replication failed for index[${transformedRequest.indexName}] with error ${e.stackTraceToString()}")
++                listener?.onFailure(e)
++            }
++        }
++    }
++}
+\ No newline at end of file
+diff --git a/src/main/kotlin/org/opensearch/replication/task/index/IndexReplicationTask.kt b/src/main/kotlin/org/opensearch/replication/task/index/IndexReplicationTask.kt
+index 48d0f33..ad537ce 100644
+--- a/src/main/kotlin/org/opensearch/replication/task/index/IndexReplicationTask.kt
++++ b/src/main/kotlin/org/opensearch/replication/task/index/IndexReplicationTask.kt
+@@ -52,6 +52,7 @@ import org.opensearch.core.action.ActionListener
+ import org.opensearch.action.admin.indices.alias.IndicesAliasesRequest
+ import org.opensearch.action.admin.indices.alias.IndicesAliasesRequest.AliasActions
+ import org.opensearch.action.admin.indices.alias.get.GetAliasesRequest
++import org.opensearch.action.admin.indices.delete.DeleteIndexAction
+ import org.opensearch.action.admin.indices.delete.DeleteIndexRequest
+ import org.opensearch.action.admin.indices.settings.get.GetSettingsRequest
+ import org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest
+@@ -92,7 +93,9 @@ import org.opensearch.persistent.PersistentTasksCustomMetadata.PersistentTask
+ import org.opensearch.persistent.PersistentTasksNodeService
+ import org.opensearch.persistent.PersistentTasksService
+ import org.opensearch.replication.ReplicationException
+-import org.opensearch.replication.MappingNotAvailableException
++import org.opensearch.replication.action.stop.InternalStopIndexReplicationAction
++import org.opensearch.replication.action.stop.StopIndexReplicationRequest
++import org.opensearch.replication.ReplicationPlugin
+ import org.opensearch.replication.ReplicationPlugin.Companion.REPLICATION_INDEX_TRANSLOG_PRUNING_ENABLED_SETTING
+ import org.opensearch.core.rest.RestStatus
+ import org.opensearch.core.tasks.TaskId
+@@ -134,6 +137,7 @@ open class IndexReplicationTask(id: Long, type: String, action: String, descript
+     override val log = Loggers.getLogger(javaClass, Index(params.followerIndexName, ClusterState.UNKNOWN_UUID))
+     private val retentionLeaseHelper = RemoteClusterRetentionLeaseHelper(clusterService.clusterName.value(), clusterService.state().metadata.clusterUUID(), remoteClient)
+     private var shouldCallEvalMonitoring = true
++    private var isLeaderIndexDeleted = false
+     private var updateSettingsContinuousFailCount = 0
+     private var updateAliasContinousFailCount = 0
+
+@@ -222,8 +226,18 @@ open class IndexReplicationTask(id: Long, type: String, action: String, descript
+                                     updateMetadata()
+                                 }
+                                 is FailedState -> {
+-                                    // Try pausing first if we get Failed state. This returns failed state if pause failed
+-                                    pauseReplication(state)
++                                    // Try pausing or stopping if we get Failed state based on settings.
++                                    // If index deletion replication is turned on in the settings and leader index is
++                                    // not available then stop the replication, otherwise pause the replication.
++                                    // This returns failed state if pause or stop failed
++                                    if (replicationSettings.replicateIndexDeletion
++                                        && state.errorMsg.contains("org.opensearch.index.IndexNotFoundException - \"no such index ["
++                                                + leaderIndex.name + "]\"")) {
++                                        isLeaderIndexDeleted = true
++                                        stopReplication(state)
++                                    } else {
++                                        pauseReplication(state)
++                                    }
+                                 }
+                                 else -> {
+                                     state
+@@ -682,6 +696,50 @@ open class IndexReplicationTask(id: Long, type: String, action: String, descript
+         return MonitoringState
+     }
+
++    private suspend fun stopReplication(state: FailedState): IndexReplicationState {
++        try {
++            log.info("Going to initiate stop of index $followerIndexName due to deletion of corresponding leader index ${leaderIndex.name}")
++            val stopReplicationResponse = client.suspendExecute(
++                replicationMetadata,
++                InternalStopIndexReplicationAction.INSTANCE, StopIndexReplicationRequest(followerIndexName),
++                defaultContext = true
++            )
++            if (!stopReplicationResponse.isAcknowledged) {
++                throw ReplicationException(
++                    "Failed to gracefully stop replication after deletion of leader index. " +
++                            "Replication tasks may need to be stopped manually and deleted follower index."
++                )
++            }
++        } catch (e: CancellationException) {
++            log.error("Encountered CancellationException while stopping $followerIndexName, ignoring it", e)
++        } catch (e: Exception) {
++            log.error("Encountered exception while stopping $followerIndexName", e)
++            return FailedState(state.failedShards,
++                "Stop failed with \"${e.message}\". Original failure for initiating stop - ${state.errorMsg}")
++        }
++        return CompletedState
++    }
++
++    private suspend fun deleteIndex() {
++        try {
++            log.info("Going to initiate deletion of index $followerIndexName due to deletion of corresponding leader index ${leaderIndex.name}")
++            val deleteIndexResponse = client.suspendExecute(
++                replicationMetadata,
++                DeleteIndexAction.INSTANCE, DeleteIndexRequest(followerIndexName),
++                defaultContext = true
++            )
++            if (!deleteIndexResponse.isAcknowledged) {
++                throw ReplicationException(
++                    "Failed to gracefully delete the follower index after deletion of the leader index. " +
++                            "Follower index may need to be deleted manually."
++                )
++            }
++        } catch (e: Exception) {
++            log.error("Encountered exception while deleting $followerIndexName", e)
++            throw e
++        }
++    }
++
+     private fun findAllReplicationFailedShardTasks(followerIndexName: String, clusterState: ClusterState)
+             :Map<ShardId, PersistentTask<ShardReplicationParams>> {
+         val persistentTasks = clusterState.metadata.custom<PersistentTasksCustomMetadata>(PersistentTasksCustomMetadata.TYPE)
+@@ -718,6 +776,12 @@ open class IndexReplicationTask(id: Long, type: String, action: String, descript
+                 client.execute(PauseIndexReplicationAction.INSTANCE,
+                         PauseIndexReplicationRequest(followerIndexName, TASK_CANCELLATION_REASON))
+             }
++
++            // Deleting the follower index if replication is stopped because of leader index deletion
++            if (clusterService.clusterSettings.get(ReplicationPlugin.REPLICATION_REPLICATE_INDEX_DELETION)
++                && currentTaskState.state == ReplicationState.COMPLETED && isLeaderIndexDeleted)  {
++                deleteIndex()
++            }
+         }
+
+         /* This is to minimise overhead of calling an additional listener as
+diff --git a/src/main/kotlin/org/opensearch/replication/util/SecurityContext.kt b/src/main/kotlin/org/opensearch/replication/util/SecurityContext.kt
+index f811324..08c285a 100644
+--- a/src/main/kotlin/org/opensearch/replication/util/SecurityContext.kt
++++ b/src/main/kotlin/org/opensearch/replication/util/SecurityContext.kt
+@@ -20,6 +20,7 @@ import org.opensearch.replication.action.repository.GetFileChunkAction
+ import org.opensearch.replication.action.repository.GetStoreMetadataAction
+ import org.opensearch.replication.action.resume.ResumeIndexReplicationAction
+ import org.opensearch.replication.action.status.ReplicationStatusAction
++import org.opensearch.replication.action.stop.InternalStopIndexReplicationAction
+ import org.opensearch.replication.action.stop.StopIndexReplicationAction
+ import org.opensearch.replication.action.update.UpdateIndexReplicationAction
+ import org.opensearch.replication.metadata.ReplicationMetadataManager
+@@ -49,7 +50,7 @@ class SecurityContext {
+         val LEADER_USER_ACTIONS = listOf(GetChangesAction.NAME, GetFileChunkAction.NAME)
+         val FOLLOWER_USER_ACTIONS = listOf(ReplayChangesAction.NAME,
+                 ReplicateIndexAction.NAME, PauseIndexReplicationAction.NAME,
+-                ResumeIndexReplicationAction.NAME, StopIndexReplicationAction.NAME,
++                ResumeIndexReplicationAction.NAME, StopIndexReplicationAction.NAME, InternalStopIndexReplicationAction.NAME,
+                 UpdateIndexReplicationAction.NAME, ReplicationStatusAction.NAME,
+                 UpdateAutoFollowPatternAction.NAME)
+
+diff --git a/src/test/kotlin/org/opensearch/replication/integ/rest/PauseReplicationIT.kt b/src/test/kotlin/org/opensearch/replication/integ/rest/PauseReplicationIT.kt
+index e622b5c..9d70f38 100644
+--- a/src/test/kotlin/org/opensearch/replication/integ/rest/PauseReplicationIT.kt
++++ b/src/test/kotlin/org/opensearch/replication/integ/rest/PauseReplicationIT.kt
+@@ -238,4 +238,47 @@ class PauseReplicationIT: MultiClusterRestTestCase() {
+             `validate status syncing response`(statusResp)
+         }, 30, TimeUnit.SECONDS)
+     }
++
++    fun `test auto pause of index replication when leader index is unavailable and disabled the property replicate delete_index explicitly`() {
++        val followerIndexName1 = "auto_pause_index"
++        val leaderIndexName1 = "leader1"
++        val followerIndexName2 = "no_auto_pause_index"
++        val leaderIndexName2 = "leader2"
++        val followerClient = getClientForCluster(FOLLOWER)
++        val leaderClient = getClientForCluster(LEADER)
++
++        // Disabling the replication of delete index explicitly
++        val settings = Settings.builder()
++            .put("plugins.replication.replicate.delete_index", false)
++            .build()
++        val request = ClusterUpdateSettingsRequest()
++        request.transientSettings(settings)
++        followerClient.cluster().putSettings(request, RequestOptions.DEFAULT)
++
++        createConnectionBetweenClusters(FOLLOWER, LEADER)
++        var createIndexResponse = leaderClient.indices().create(CreateIndexRequest(leaderIndexName1), RequestOptions.DEFAULT)
++        assertThat(createIndexResponse.isAcknowledged).isTrue()
++        createIndexResponse = leaderClient.indices().create(CreateIndexRequest(leaderIndexName2), RequestOptions.DEFAULT)
++        assertThat(createIndexResponse.isAcknowledged).isTrue()
++        // For followerIndexName1
++        followerClient.startReplication(StartReplicationRequest("source", leaderIndexName1,
++            followerIndexName1), waitForRestore = true)
++        // For followerIndexName2
++        followerClient.startReplication(StartReplicationRequest("source", leaderIndexName2,
++            followerIndexName2), waitForRestore = true)
++        val deleteResponse = leaderClient.indices().delete(DeleteIndexRequest(leaderIndexName1), RequestOptions.DEFAULT)
++        assertThat(deleteResponse.isAcknowledged)
++        // followerIndexName1 -> autopause
++        assertBusy({
++            var statusResp = followerClient.replicationStatus(followerIndexName1)
++            assertThat(statusResp.containsKey("status"))
++            assertThat(statusResp.containsKey("reason"))
++            `validate paused status response due to leader index deleted`(statusResp)
++        }, 30, TimeUnit.SECONDS)
++        // followerIndexName2 -> Syncing state
++        assertBusy({
++            var statusResp = followerClient.replicationStatus(followerIndexName2)
++            `validate status syncing response`(statusResp)
++        }, 30, TimeUnit.SECONDS)
++    }
+ }
+diff --git a/src/test/kotlin/org/opensearch/replication/integ/rest/StopReplicationIT.kt b/src/test/kotlin/org/opensearch/replication/integ/rest/StopReplicationIT.kt
+index 54caa11..00a486f 100644
+--- a/src/test/kotlin/org/opensearch/replication/integ/rest/StopReplicationIT.kt
++++ b/src/test/kotlin/org/opensearch/replication/integ/rest/StopReplicationIT.kt
+@@ -30,6 +30,7 @@ import org.opensearch.action.admin.cluster.settings.ClusterUpdateSettingsRequest
+ import org.opensearch.action.admin.cluster.snapshots.create.CreateSnapshotRequest
+ import org.opensearch.action.admin.cluster.snapshots.restore.RestoreSnapshotRequest
+ import org.opensearch.action.admin.cluster.snapshots.status.SnapshotsStatusRequest
++import org.opensearch.action.admin.indices.delete.DeleteIndexRequest
+ import org.opensearch.action.index.IndexRequest
+ import org.opensearch.client.Request
+ import org.opensearch.client.RequestOptions
+@@ -243,6 +244,42 @@ class StopReplicationIT: MultiClusterRestTestCase() {
+         followerClient.index(IndexRequest(followerIndexName).id("2").source(sourceMap), RequestOptions.DEFAULT)
+     }
+
++    fun `test delete follower index when leader index is unavailable`() {
++        val followerIndexName2 = "follower_index2"
++        val leaderIndexName2 = "leader_index2"
++        val followerClient = getClientForCluster(FOLLOWER)
++        val leaderClient = getClientForCluster(LEADER)
++
++        // Enabling the replication of delete index
++        val settings = Settings.builder()
++            .put("plugins.replication.replicate.delete_index", true)
++            .build()
++        val request = ClusterUpdateSettingsRequest()
++        request.transientSettings(settings)
++        followerClient.cluster().putSettings(request, RequestOptions.DEFAULT)
++
++        createConnectionBetweenClusters(FOLLOWER, LEADER, "source")
++        val createIndex1Response = leaderClient.indices().create(CreateIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
++        assertThat(createIndex1Response.isAcknowledged).isTrue()
++        val createIndex2Response = leaderClient.indices().create(CreateIndexRequest(leaderIndexName2), RequestOptions.DEFAULT)
++        assertThat(createIndex2Response.isAcknowledged).isTrue()
++        followerClient.startReplication(StartReplicationRequest("source", leaderIndexName, followerIndexName),
++            waitForRestore = true)
++        followerClient.startReplication(StartReplicationRequest("source", leaderIndexName2, followerIndexName2),
++            waitForRestore = true)
++
++        val deleteResponse = leaderClient.indices().delete(DeleteIndexRequest(leaderIndexName), RequestOptions.DEFAULT)
++        assertThat(deleteResponse.isAcknowledged)
++
++        logger.info(followerClient.indices())
++
++        // Make sure follower index got deleted after it is deleted from the leader, and it didn't affect any other indexes
++        assertBusy({
++            Assert.assertFalse(followerClient.indices().exists(GetIndexRequest(followerIndexName), RequestOptions.DEFAULT))
++        }, 30, TimeUnit.SECONDS)
++        Assert.assertTrue(followerClient.indices().exists(GetIndexRequest(followerIndexName2), RequestOptions.DEFAULT))
++    }
++
+     fun `test stop replication with stale replication settings at leader cluster`() {
+
+         Assume.assumeFalse(SNAPSHOTS_NOT_ACCESSIBLE_FOR_REMOTE_CLUSTERS, checkifIntegTestRemote())
